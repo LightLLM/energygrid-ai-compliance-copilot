@@ -1,0 +1,101 @@
+# SAM configuration file for EnergyGrid.AI Compliance Copilot
+
+version = 0.1
+
+[default]
+[default.global]
+[default.global.parameters]
+stack_name = "energygrid-compliance-copilot"
+
+[default.build]
+[default.build.parameters]
+cached = true
+parallel = true
+use_container = false
+
+[default.validate]
+[default.validate.parameters]
+lint = true
+
+[default.deploy]
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+s3_prefix = "energygrid-compliance-copilot"
+region = "us-east-1"
+image_repositories = []
+disable_rollback = false
+on_failure = "ROLLBACK"
+
+[dev]
+[dev.global]
+[dev.global.parameters]
+stack_name = "energygrid-compliance-copilot-dev"
+
+[dev.build]
+[dev.build.parameters]
+cached = true
+parallel = true
+use_container = false
+
+[dev.deploy]
+[dev.deploy.parameters]
+stack_name = "energygrid-compliance-copilot-dev"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+resolve_s3 = true
+s3_prefix = "energygrid-compliance-copilot-dev"
+region = "us-east-1"
+parameter_overrides = "Environment=dev CognitoDomainPrefix=energygrid-ai-compliance-dev"
+tags = "Environment=dev Project=EnergyGrid-AI Owner=DevTeam CostCenter=Development"
+disable_rollback = false
+on_failure = "ROLLBACK"
+
+[staging]
+[staging.global]
+[staging.global.parameters]
+stack_name = "energygrid-compliance-copilot-staging"
+
+[staging.build]
+[staging.build.parameters]
+cached = true
+parallel = true
+use_container = false
+
+[staging.deploy]
+[staging.deploy.parameters]
+stack_name = "energygrid-compliance-copilot-staging"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+s3_prefix = "energygrid-compliance-copilot-staging"
+region = "us-east-1"
+parameter_overrides = "Environment=staging CognitoDomainPrefix=energygrid-ai-compliance-staging"
+tags = "Environment=staging Project=EnergyGrid-AI Owner=QATeam CostCenter=Testing"
+disable_rollback = false
+on_failure = "ROLLBACK"
+
+[prod]
+[prod.global]
+[prod.global.parameters]
+stack_name = "energygrid-compliance-copilot-prod"
+
+[prod.build]
+[prod.build.parameters]
+cached = true
+parallel = true
+use_container = false
+
+[prod.deploy]
+[prod.deploy.parameters]
+stack_name = "energygrid-compliance-copilot-prod"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+s3_prefix = "energygrid-compliance-copilot-prod"
+region = "us-east-1"
+parameter_overrides = "Environment=prod CognitoDomainPrefix=energygrid-ai-compliance-prod"
+tags = "Environment=prod Project=EnergyGrid-AI Owner=ProductionTeam CostCenter=Production"
+disable_rollback = true
+on_failure = "DO_NOTHING"

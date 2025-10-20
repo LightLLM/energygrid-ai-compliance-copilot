@@ -1,0 +1,12 @@
+{
+  "Parameters": {
+    "Environment": "prod",
+    "CognitoDomainPrefix": "energygrid-ai-compliance-prod"
+  },
+  "Tags": {
+    "Environment": "prod",
+    "Project": "EnergyGrid-AI",
+    "Owner": "ProductionTeam",
+    "CostCenter": "Production"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "Parameters": {
+    "Environment": "staging",
+    "CognitoDomainPrefix": "energygrid-ai-compliance-staging"
+  },
+  "Tags": {
+    "Environment": "staging",
+    "Project": "EnergyGrid-AI",
+    "Owner": "QATeam",
+    "CostCenter": "Testing"
+  }
+}

@@ -1,0 +1,298 @@
+name: Deploy EnergyGrid.AI Compliance Copilot
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'release/*'
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      region:
+        description: 'AWS Region'
+        required: true
+        default: 'us-east-1'
+        type: string
+
+env:
+  AWS_REGION: ${{ github.event.inputs.region || 'us-east-1' }}
+  PYTHON_VERSION: '3.11'
+  SAM_CLI_VERSION: '1.100.0'
+
+jobs:
+  # Determine environment based on branch or input
+  determine-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      should-deploy: ${{ steps.set-env.outputs.should-deploy }}
+    steps:
+      - name: Determine environment
+        id: set-env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+            echo "should-deploy=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+            echo "should-deploy=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "should-deploy=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == refs/heads/release/* ]]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "should-deploy=true" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "should-deploy=false" >> $GITHUB_OUTPUT
+          fi
+
+  # Validate and test
+  validate-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-mock boto3 moto
+
+      - name: Set up SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          version: ${{ env.SAM_CLI_VERSION }}
+
+      - name: Validate SAM template
+        run: |
+          sam validate --lint
+
+      - name: Run comprehensive test suite
+        run: |
+          python tests/ci_test_runner.py
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+
+      - name: Build SAM application
+        run: |
+          sam build --cached --parallel
+
+      - name: Cache SAM build
+        uses: actions/cache@v3
+        with:
+          path: .aws-sam
+          key: ${{ runner.os }}-sam-${{ hashFiles('template.yaml', 'src/**/*.py') }}
+
+  # Security scanning
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Bandit security scan
+        run: |
+          pip install bandit
+          bandit -r src/ -f json -o bandit-report.json || true
+
+      - name: Run Safety check
+        run: |
+          pip install safety
+          safety check --json --output safety-report.json || true
+
+      - name: Upload security scan results
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            safety-report.json
+
+  # Deploy to environment
+  deploy:
+    needs: [determine-environment, validate-and-test, security-scan]
+    if: needs.determine-environment.outputs.should-deploy == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          version: ${{ env.SAM_CLI_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Restore SAM build cache
+        uses: actions/cache@v3
+        with:
+          path: .aws-sam
+          key: ${{ runner.os }}-sam-${{ hashFiles('template.yaml', 'src/**/*.py') }}
+
+      - name: Build SAM application (if cache miss)
+        run: |
+          if [ ! -d ".aws-sam" ]; then
+            sam build --cached --parallel
+          fi
+
+      - name: Deploy to ${{ needs.determine-environment.outputs.environment }}
+        run: |
+          sam deploy \
+            --config-env ${{ needs.determine-environment.outputs.environment }} \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset
+
+      - name: Get stack outputs
+        id: stack-outputs
+        run: |
+          STACK_NAME="energygrid-compliance-copilot-${{ needs.determine-environment.outputs.environment }}"
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApiGatewayUrl`].OutputValue' \
+            --output text)
+          echo "api-url=$API_URL" >> $GITHUB_OUTPUT
+
+      - name: Run smoke tests
+        run: |
+          # Install test dependencies
+          pip install requests pytest
+          
+          # Run smoke tests
+          export API_BASE_URL="${{ steps.stack-outputs.outputs.api-url }}"
+          python -m pytest tests/smoke_tests.py -v || true
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "✅ Deployment to ${{ needs.determine-environment.outputs.environment }} completed successfully!"
+          echo "🌐 API URL: ${{ steps.stack-outputs.outputs.api-url }}"
+
+      - name: Notify deployment failure
+        if: failure()
+        run: |
+          echo "❌ Deployment to ${{ needs.determine-environment.outputs.environment }} failed!"
+
+  # Integration tests (only for staging and prod)
+  integration-tests:
+    needs: [determine-environment, deploy]
+    if: needs.determine-environment.outputs.environment != 'dev' && needs.deploy.result == 'success'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install test dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest requests boto3
+
+      - name: Run integration tests
+        run: |
+          export ENVIRONMENT="${{ needs.determine-environment.outputs.environment }}"
+          python -m pytest tests/integration/ -v --tb=short
+
+  # Performance tests (only for staging)
+  performance-tests:
+    needs: [determine-environment, deploy]
+    if: needs.determine-environment.outputs.environment == 'staging' && needs.deploy.result == 'success'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install performance testing tools
+        run: |
+          pip install locust pytest
+
+      - name: Run performance tests
+        run: |
+          # Run basic load tests
+          python tests/performance/load_test.py || true
+
+  # Rollback job (manual trigger only)
+  rollback:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.rollback == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Rollback deployment
+        run: |
+          STACK_NAME="energygrid-compliance-copilot-${{ github.event.inputs.environment }}"
+          aws cloudformation cancel-update-stack --stack-name $STACK_NAME || true
+          aws cloudformation continue-update-rollback --stack-name $STACK_NAME

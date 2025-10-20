@@ -1,0 +1,1388 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: EnergyGrid.AI Compliance Copilot - Serverless AI compliance management system
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+  
+  CognitoDomainPrefix:
+    Type: String
+    Default: energygrid-ai-compliance
+    Description: Cognito domain prefix for hosted UI
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 30
+    MemorySize: 512
+    Tracing: Active
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        DOCUMENTS_TABLE: !Ref DocumentsTable
+        OBLIGATIONS_TABLE: !Ref ObligationsTable
+        TASKS_TABLE: !Ref TasksTable
+        REPORTS_TABLE: !Ref ReportsTable
+        PROCESSING_STATUS_TABLE: !Ref ProcessingStatusTable
+        DOCUMENTS_BUCKET: !Ref DocumentsBucket
+        REPORTS_BUCKET: !Ref ReportsBucket
+        UPLOAD_QUEUE: !Ref UploadQueue
+        ANALYSIS_QUEUE: !Ref AnalysisQueue
+        PLANNING_QUEUE: !Ref PlanningQueue
+        REPORTING_QUEUE: !Ref ReportingQueue
+        NOTIFICATION_TOPIC: !Ref NotificationTopic
+        NOTIFICATION_TOPIC_ARN: !Ref NotificationTopic
+        _X_AMZN_TRACE_ID: !Sub "${AWS::StackName}-trace"
+
+Resources:
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${Environment}-energygrid-compliance-users"
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: given_name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: family_name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${Environment}-energygrid-compliance-client"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ADMIN_NO_SRP_AUTH
+        - USER_PASSWORD_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "${CognitoDomainPrefix}-${Environment}"
+      UserPoolId: !Ref UserPool
+
+  # Cognito User Groups for Role-Based Access Control
+  ComplianceOfficerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: ComplianceOfficers
+      Description: Compliance officers with full access to documents, obligations, and tasks
+      UserPoolId: !Ref UserPool
+      Precedence: 1
+
+  ComplianceManagerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: ComplianceManagers
+      Description: Compliance managers with full access plus report generation and user management
+      UserPoolId: !Ref UserPool
+      Precedence: 0
+
+  AuditorGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Auditors
+      Description: External auditors with read-only access to reports and obligations
+      UserPoolId: !Ref UserPool
+      Precedence: 2
+
+  ViewerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Viewers
+      Description: Read-only access to basic compliance information
+      UserPoolId: !Ref UserPool
+      Precedence: 3
+
+  # S3 Buckets
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Environment}-energygrid-documents-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Environment}-energygrid-reports-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # DynamoDB Tables
+  DocumentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Environment}-energygrid-documents"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: document_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: upload_timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: document_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: upload-timestamp-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: upload_timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      BackupPolicy:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: EnergyGrid-AI
+
+  ObligationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Environment}-energygrid-obligations"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: obligation_id
+          AttributeType: S
+        - AttributeName: document_id
+          AttributeType: S
+        - AttributeName: category
+          AttributeType: S
+        - AttributeName: severity
+          AttributeType: S
+        - AttributeName: created_timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: obligation_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: document-index
+          KeySchema:
+            - AttributeName: document_id
+              KeyType: HASH
+            - AttributeName: created_timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: category-index
+          KeySchema:
+            - AttributeName: category
+              KeyType: HASH
+            - AttributeName: severity
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: severity-index
+          KeySchema:
+            - AttributeName: severity
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      BackupPolicy:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: EnergyGrid-AI
+
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Environment}-energygrid-tasks"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: task_id
+          AttributeType: S
+        - AttributeName: obligation_id
+          AttributeType: S
+        - AttributeName: assigned_to
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: due_date
+          AttributeType: S
+        - AttributeName: priority
+          AttributeType: S
+      KeySchema:
+        - AttributeName: task_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: obligation-index
+          KeySchema:
+            - AttributeName: obligation_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: assigned-to-index
+          KeySchema:
+            - AttributeName: assigned_to
+              KeyType: HASH
+            - AttributeName: due_date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: due_date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: priority-index
+          KeySchema:
+            - AttributeName: priority
+              KeyType: HASH
+            - AttributeName: due_date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      BackupPolicy:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: EnergyGrid-AI
+
+  ReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Environment}-energygrid-reports"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: report_id
+          AttributeType: S
+        - AttributeName: generated_by
+          AttributeType: S
+        - AttributeName: created_timestamp
+          AttributeType: S
+        - AttributeName: report_type
+          AttributeType: S
+      KeySchema:
+        - AttributeName: report_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: generated-by-index
+          KeySchema:
+            - AttributeName: generated_by
+              KeyType: HASH
+            - AttributeName: created_timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: report-type-index
+          KeySchema:
+            - AttributeName: report_type
+              KeyType: HASH
+            - AttributeName: created_timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      BackupPolicy:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: EnergyGrid-AI
+
+  ProcessingStatusTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Environment}-energygrid-processing-status"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: document_id
+          AttributeType: S
+        - AttributeName: stage
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: updated_timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: document_id
+          KeyType: HASH
+        - AttributeName: stage
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: updated_timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      BackupPolicy:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: EnergyGrid-AI
+
+  # SQS Queues
+  UploadQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-energygrid-upload-queue"
+      VisibilityTimeoutSeconds: 300
+      MessageRetentionPeriod: 1209600  # 14 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt UploadDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  UploadDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-energygrid-upload-dlq"
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  AnalysisQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-energygrid-analysis-queue"
+      VisibilityTimeoutSeconds: 900  # 15 minutes
+      MessageRetentionPeriod: 1209600  # 14 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AnalysisDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  AnalysisDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-energygrid-analysis-dlq"
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  PlanningQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-energygrid-planning-queue"
+      VisibilityTimeoutSeconds: 600  # 10 minutes
+      MessageRetentionPeriod: 1209600  # 14 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PlanningDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  PlanningDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-energygrid-planning-dlq"
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  ReportingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-energygrid-reporting-queue"
+      VisibilityTimeoutSeconds: 600  # 10 minutes
+      MessageRetentionPeriod: 1209600  # 14 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ReportingDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  ReportingDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-energygrid-reporting-dlq"
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # SNS Topic
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${Environment}-energygrid-notifications"
+      DisplayName: EnergyGrid.AI Notifications
+      DeliveryStatusLogging:
+        - Protocol: lambda
+          SuccessFeedbackRoleArn: !GetAtt SNSLoggingRole.Arn
+          FailureFeedbackRoleArn: !GetAtt SNSLoggingRole.Arn
+        - Protocol: email
+          SuccessFeedbackRoleArn: !GetAtt SNSLoggingRole.Arn
+          FailureFeedbackRoleArn: !GetAtt SNSLoggingRole.Arn
+
+  # SNS Logging Role
+  SNSLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SNSLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # CloudWatch Alarms for Critical Failures
+  AnalyzerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-energygrid-analyzer-errors"
+      AlarmDescription: "High error rate in Analyzer Lambda function"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AnalyzerFunction
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+
+  PlannerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-energygrid-planner-errors"
+      AlarmDescription: "High error rate in Planner Lambda function"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PlannerFunction
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+
+  ReporterErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-energygrid-reporter-errors"
+      AlarmDescription: "High error rate in Reporter Lambda function"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReporterFunction
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+
+  UploadErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-energygrid-upload-errors"
+      AlarmDescription: "High error rate in Upload Lambda function"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref UploadFunction
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+
+  # Duration Alarms
+  AnalyzerDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-energygrid-analyzer-duration"
+      AlarmDescription: "High duration in Analyzer Lambda function"
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 840000  # 14 minutes in milliseconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AnalyzerFunction
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+
+  # Queue Depth Alarms
+  AnalysisQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-energygrid-analysis-queue-depth"
+      AlarmDescription: "High message count in Analysis queue"
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt AnalysisQueue.QueueName
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+
+  PlanningQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-energygrid-planning-queue-depth"
+      AlarmDescription: "High message count in Planning queue"
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt PlanningQueue.QueueName
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+
+  # Dead Letter Queue Alarms
+  AnalysisDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-energygrid-analysis-dlq-messages"
+      AlarmDescription: "Messages in Analysis Dead Letter Queue"
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt AnalysisDeadLetterQueue.QueueName
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+
+  PlanningDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-energygrid-planning-dlq-messages"
+      AlarmDescription: "Messages in Planning Dead Letter Queue"
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt PlanningDeadLetterQueue.QueueName
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+
+  # Custom Resource to Set Up Additional Monitoring
+  MonitoringSetup:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt MonitoringSetupFunction.Arn
+      sns_topic_arn: !Ref NotificationTopic
+    DependsOn:
+      - MonitoringSetupFunction
+      - NotificationTopic
+
+  # SNS Topic Policy
+  NotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref NotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - SNS:Subscribe
+              - SNS:Unsubscribe
+              - SNS:Publish
+            Resource: !Ref NotificationTopic
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - SNS:Publish
+            Resource: !Ref NotificationTopic
+
+  # Lambda Functions
+  UploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-upload"
+      CodeUri: src/upload/
+      Handler: handler.lambda_handler
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          ANALYSIS_QUEUE_URL: !Ref AnalysisQueue
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref DocumentsBucket
+        - DynamoDBWritePolicy:
+            TableName: !Ref DocumentsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref ProcessingStatusTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt AnalysisQueue.QueueName
+        - AWSXRayDaemonWriteAccess
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sts:GetCallerIdentity
+              Resource: "*"
+      Events:
+        UploadApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /documents/upload
+            Method: post
+            Auth:
+              Authorizer: CognitoAuthorizer
+            RequestValidator: BodyAndParametersValidator
+            RequestModel:
+              Model: UploadRequestModel
+              Required: true
+
+  UploadOptionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-upload-options"
+      CodeUri: src/upload/
+      Handler: options_handler.lambda_handler
+      Timeout: 10
+      MemorySize: 128
+      Events:
+        UploadOptionsApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /documents/upload
+            Method: options
+            Auth:
+              Authorizer: NONE
+
+  AnalyzerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-analyzer"
+      CodeUri: src/analyzer/
+      Handler: handler.lambda_handler
+      Timeout: 900
+      MemorySize: 3008
+      Environment:
+        Variables:
+          ANALYSIS_QUEUE_URL: !Ref AnalysisQueue
+          PLANNING_QUEUE_URL: !Ref PlanningQueue
+          ANALYSIS_DLQ_URL: !Ref AnalysisDeadLetterQueue
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DocumentsBucket
+        - DynamoDBWritePolicy:
+            TableName: !Ref ObligationsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref ProcessingStatusTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt PlanningQueue.QueueName
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NotificationTopic.TopicName
+        - AWSXRayDaemonWriteAccess
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt AnalysisQueue.Arn
+            BatchSize: 1
+
+  PlannerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-planner"
+      CodeUri: src/planner/
+      Handler: handler.lambda_handler
+      Timeout: 600
+      MemorySize: 1024
+      Environment:
+        Variables:
+          PLANNING_QUEUE_URL: !Ref PlanningQueue
+          REPORTING_QUEUE_URL: !Ref ReportingQueue
+          PLANNING_DLQ_URL: !Ref PlanningDeadLetterQueue
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ObligationsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref TasksTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref ProcessingStatusTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ReportingQueue.QueueName
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NotificationTopic.TopicName
+        - AWSXRayDaemonWriteAccess
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt PlanningQueue.Arn
+            BatchSize: 1
+
+  ReporterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-reporter"
+      CodeUri: src/reporter/
+      Handler: handler.lambda_handler
+      Timeout: 600
+      MemorySize: 2048
+      Environment:
+        Variables:
+          REPORTING_QUEUE_URL: !Ref ReportingQueue
+          REPORTING_DLQ_URL: !Ref ReportingDeadLetterQueue
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ObligationsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TasksTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref ReportsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref ProcessingStatusTable
+        - S3WritePolicy:
+            BucketName: !Ref ReportsBucket
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NotificationTopic.TopicName
+        - AWSXRayDaemonWriteAccess
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ReportingQueue.Arn
+            BatchSize: 1
+
+  StatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-status"
+      CodeUri: src/status/
+      Handler: handler.lambda_handler
+      Timeout: 30
+      MemorySize: 512
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ProcessingStatusTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref DocumentsTable
+        - AWSXRayDaemonWriteAccess
+      Events:
+        StatusApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /documents/{id}/status
+            Method: get
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Lambda Authorizer Function
+  AuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-authorizer"
+      CodeUri: src/auth/
+      Handler: authorizer.lambda_handler
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+
+  # API Endpoint Functions
+  ObligationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-obligations-api"
+      CodeUri: src/api/
+      Handler: obligations_handler.lambda_handler
+      Timeout: 30
+      MemorySize: 512
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ObligationsTable
+        - AWSXRayDaemonWriteAccess
+      Events:
+        ObligationsApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /obligations
+            Method: get
+            Auth:
+              Authorizer: CognitoAuthorizer
+            RequestValidator: ParametersValidator
+            RequestParameters:
+              - method.request.querystring.category
+              - method.request.querystring.severity
+              - method.request.querystring.document_id
+              - method.request.querystring.limit
+              - method.request.querystring.offset
+
+  ObligationsOptionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-obligations-options"
+      CodeUri: src/api/
+      Handler: obligations_handler.options_handler
+      Timeout: 10
+      MemorySize: 128
+      Events:
+        ObligationsOptionsApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /obligations
+            Method: options
+            Auth:
+              Authorizer: NONE
+
+  TasksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-tasks-api"
+      CodeUri: src/api/
+      Handler: tasks_handler.lambda_handler
+      Timeout: 30
+      MemorySize: 512
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TasksTable
+        - AWSXRayDaemonWriteAccess
+      Events:
+        TasksApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /tasks
+            Method: get
+            Auth:
+              Authorizer: CognitoAuthorizer
+            RequestValidator: ParametersValidator
+            RequestParameters:
+              - method.request.querystring.status
+              - method.request.querystring.priority
+              - method.request.querystring.assigned_to
+              - method.request.querystring.obligation_id
+              - method.request.querystring.limit
+              - method.request.querystring.offset
+              - method.request.querystring.sort_by
+              - method.request.querystring.sort_order
+
+  TasksOptionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-tasks-options"
+      CodeUri: src/api/
+      Handler: tasks_handler.options_handler
+      Timeout: 10
+      MemorySize: 128
+      Events:
+        TasksOptionsApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /tasks
+            Method: options
+            Auth:
+              Authorizer: NONE
+
+  ReportsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-reports-api"
+      CodeUri: src/api/
+      Handler: reports_handler.lambda_handler
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          REPORTING_QUEUE_URL: !Ref ReportingQueue
+          REPORTS_BUCKET: !Ref ReportsBucket
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ReportsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref ReportsTable
+        - S3ReadPolicy:
+            BucketName: !Ref ReportsBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ReportingQueue.QueueName
+        - AWSXRayDaemonWriteAccess
+      Events:
+        ReportsGenerateApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /reports/generate
+            Method: post
+            Auth:
+              Authorizer: CognitoAuthorizer
+            RequestValidator: BodyAndParametersValidator
+            RequestModel:
+              Model: ReportGenerateRequestModel
+              Required: true
+        ReportsGetApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /reports/{id}
+            Method: get
+            Auth:
+              Authorizer: CognitoAuthorizer
+            RequestValidator: ParametersValidator
+            RequestParameters:
+              - method.request.path.id
+
+  ReportsOptionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-reports-options"
+      CodeUri: src/api/
+      Handler: reports_handler.options_handler
+      Timeout: 10
+      MemorySize: 128
+      Events:
+        ReportsGenerateOptionsApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /reports/generate
+            Method: options
+            Auth:
+              Authorizer: NONE
+        ReportsGetOptionsApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /reports/{id}
+            Method: options
+            Auth:
+              Authorizer: NONE
+
+  # Monitoring Setup Function
+  MonitoringSetupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-monitoring-setup"
+      CodeUri: src/monitoring/
+      Handler: setup_handler.lambda_handler
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          NOTIFICATION_TOPIC_ARN: !Ref NotificationTopic
+      Policies:
+        - AWSXRayDaemonWriteAccess
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cloudwatch:PutMetricAlarm
+                - cloudwatch:PutDashboard
+                - cloudwatch:PutMetricData
+                - cloudwatch:DescribeAlarms
+              Resource: "*"
+
+  # DLQ Processor Function
+  DLQProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-dlq-processor"
+      CodeUri: src/shared/
+      Handler: dlq_handler.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          UPLOAD_DLQ_URL: !Ref UploadDeadLetterQueue
+          ANALYSIS_DLQ_URL: !Ref AnalysisDeadLetterQueue
+          PLANNING_DLQ_URL: !Ref PlanningDeadLetterQueue
+          REPORTING_DLQ_URL: !Ref ReportingDeadLetterQueue
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt UploadDeadLetterQueue.QueueName
+        - SQSPollerPolicy:
+            QueueName: !GetAtt AnalysisDeadLetterQueue.QueueName
+        - SQSPollerPolicy:
+            QueueName: !GetAtt PlanningDeadLetterQueue.QueueName
+        - SQSPollerPolicy:
+            QueueName: !GetAtt ReportingDeadLetterQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt AnalysisQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt PlanningQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ReportingQueue.QueueName
+        - DynamoDBReadPolicy:
+            TableName: !Ref DocumentsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref ReportsTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NotificationTopic.TopicName
+        - AWSXRayDaemonWriteAccess
+      Events:
+        # Schedule DLQ processing every 15 minutes
+        DLQProcessingSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(15 minutes)
+            Description: "Process dead letter queues every 15 minutes"
+
+  # Permission for API Gateway to invoke Lambda Authorizer
+  AuthorizerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/authorizers/*"
+
+  # API Gateway
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${Environment}-energygrid-api"
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+            AuthType: COGNITO_USER_POOLS
+            IdentitySource: method.request.header.Authorization
+          CustomAuthorizer:
+            FunctionArn: !GetAtt AuthorizerFunction.Arn
+            AuthType: TOKEN
+            IdentitySource: method.request.header.Authorization
+        DefaultAuthorizer: CognitoAuthorizer
+      ThrottleSettings:
+        RateLimit: 1000
+        BurstLimit: 2000
+      RequestValidators:
+        BodyValidator:
+          ValidateRequestBody: true
+          ValidateRequestParameters: false
+        ParametersValidator:
+          ValidateRequestBody: false
+          ValidateRequestParameters: true
+        BodyAndParametersValidator:
+          ValidateRequestBody: true
+          ValidateRequestParameters: true
+      Models:
+        UploadRequestModel:
+          ContentType: multipart/form-data
+          Schema:
+            type: object
+            properties:
+              file:
+                type: string
+                format: binary
+                description: PDF file to upload
+            required:
+              - file
+        ReportGenerateRequestModel:
+          ContentType: application/json
+          Schema:
+            type: object
+            properties:
+              report_type:
+                type: string
+                enum: [compliance_summary, audit_readiness, obligation_status, task_progress]
+                description: Type of report to generate
+              title:
+                type: string
+                maxLength: 200
+                description: Custom title for the report
+              date_range:
+                type: object
+                properties:
+                  start_date:
+                    type: string
+                    format: date
+                  end_date:
+                    type: string
+                    format: date
+              filters:
+                type: object
+                properties:
+                  category:
+                    type: string
+                  severity:
+                    type: string
+                  status:
+                    type: string
+            required:
+              - report_type
+        ErrorResponseModel:
+          ContentType: application/json
+          Schema:
+            type: object
+            properties:
+              success:
+                type: boolean
+                default: false
+              error:
+                type: string
+              timestamp:
+                type: string
+                format: date-time
+            required:
+              - success
+              - error
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+          ResponseTemplates:
+            application/json: |
+              {
+                "success": false,
+                "error": "Client error occurred",
+                "timestamp": "$context.requestTime"
+              }
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+          ResponseTemplates:
+            application/json: |
+              {
+                "success": false,
+                "error": "Internal server error",
+                "timestamp": "$context.requestTime"
+              }
+        BAD_REQUEST_BODY:
+          StatusCode: 400
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+          ResponseTemplates:
+            application/json: |
+              {
+                "success": false,
+                "error": "Invalid request format",
+                "timestamp": "$context.requestTime"
+              }
+        REQUEST_TOO_LARGE:
+          StatusCode: 413
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+          ResponseTemplates:
+            application/json: |
+              {
+                "success": false,
+                "error": "File size exceeds maximum limit",
+                "timestamp": "$context.requestTime"
+              }
+        UNAUTHORIZED:
+          StatusCode: 401
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+          ResponseTemplates:
+            application/json: |
+              {
+                "success": false,
+                "error": "Authentication required",
+                "timestamp": "$context.requestTime"
+              }
+        ACCESS_DENIED:
+          StatusCode: 403
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+          ResponseTemplates:
+            application/json: |
+              {
+                "success": false,
+                "error": "Access denied",
+                "timestamp": "$context.requestTime"
+              }
+        THROTTLED:
+          StatusCode: 429
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              Retry-After: "'60'"
+          ResponseTemplates:
+            application/json: |
+              {
+                "success": false,
+                "error": "Rate limit exceeded. Please try again later.",
+                "timestamp": "$context.requestTime"
+              }
+
+Outputs:
+  ApiGatewayUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${Environment}-energygrid-api-url"
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub "${Environment}-energygrid-user-pool-id"
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub "${Environment}-energygrid-user-pool-client-id"
+
+  DocumentsBucketName:
+    Description: S3 bucket for documents
+    Value: !Ref DocumentsBucket
+    Export:
+      Name: !Sub "${Environment}-energygrid-documents-bucket"
+
+  ReportsBucketName:
+    Description: S3 bucket for reports
+    Value: !Ref ReportsBucket
+    Export:
+      Name: !Sub "${Environment}-energygrid-reports-bucket"
