@@ -1,3 +1,4 @@
+
 # EnergyGrid.AI Compliance Copilot
 
 [![Build Status](https://github.com/your-org/energygrid-ai-compliance-copilot/workflows/Deploy/badge.svg)](https://github.com/your-org/energygrid-ai-compliance-copilot/actions)
@@ -838,3 +839,4 @@ We welcome feature requests! Please provide:
 ---
 
 **Built with ❤️ by the EnergyGrid.AI Team**
+
