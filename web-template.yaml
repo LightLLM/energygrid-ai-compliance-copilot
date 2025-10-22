@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: EnergyGrid.AI Web Application - Streamlit Frontend
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+Resources:
+  # ECS Cluster for Web App
+  WebCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${Environment}-energygrid-web-cluster"
+
+  # Task Definition for Streamlit App
+  WebTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Environment}-energygrid-web"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 256
+      Memory: 512
+      ExecutionRoleArn: !GetAtt WebTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: streamlit-app
+          Image: python:3.11-slim
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8501
+              Protocol: tcp
+          Environment:
+            - Name: API_BASE_URL
+              Value: https://6to1dnyqsd.execute-api.us-east-1.amazonaws.com/Stage
+          Command:
+            - /bin/bash
+            - -c
+            - |
+              pip install streamlit pandas plotly requests
+              echo 'import streamlit as st
+              st.title("🌟 EnergyGrid.AI Compliance Copilot")
+              st.success("✅ Application is running on AWS!")
+              st.info("API Endpoint: https://6to1dnyqsd.execute-api.us-east-1.amazonaws.com/Stage/test")
+              if st.button("Test API"):
+                  import requests
+                  try:
+                      response = requests.get("https://6to1dnyqsd.execute-api.us-east-1.amazonaws.com/Stage/test")
+                      st.json(response.json())
+                  except Exception as e:
+                      st.error(f"Error: {e}")' > app.py
+              streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+
+  # IAM Role for Task Execution
+  WebTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+Outputs:
+  ClusterName:
+    Description: ECS Cluster Name
+    Value: !Ref WebCluster
+    
+  TaskDefinitionArn:
+    Description: Task Definition ARN
+    Value: !Ref WebTaskDefinition

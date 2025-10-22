@@ -1,0 +1,95 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: EnergyGrid.AI Compliance Copilot - Simplified for initial deployment
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 30
+    MemorySize: 512
+    Tracing: Active
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+
+Resources:
+  # S3 Bucket for Documents
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Environment}-energygrid-documents-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # DynamoDB Table for Documents
+  DocumentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Environment}-energygrid-documents"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: document_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: document_id
+          KeyType: HASH
+
+  # Simple Lambda Function for Testing
+  TestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-test"
+      CodeUri: src/test/
+      Handler: handler.lambda_handler
+      Events:
+        TestApi:
+          Type: Api
+          Properties:
+            Path: /test
+            Method: get
+
+  # Web Interface Function
+  WebFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-web"
+      CodeUri: src/web-simple/
+      Handler: handler.lambda_handler
+      Events:
+        WebApi:
+          Type: Api
+          Properties:
+            Path: /
+            Method: get
+        WebApiAny:
+          Type: Api
+          Properties:
+            Path: /{proxy+}
+            Method: any
+
+Outputs:
+  WebApplicationUrl:
+    Description: Web Application URL - Open this in your browser!
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Stage"
+    
+  ApiGatewayUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Stage"
+    
+  DocumentsBucketName:
+    Description: S3 bucket for documents
+    Value: !Ref DocumentsBucket
+    
+  DocumentsTableName:
+    Description: DynamoDB table for documents
+    Value: !Ref DocumentsTable

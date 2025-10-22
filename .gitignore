@@ -211,3 +211,22 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# Sensitive files
+git.txt
+response.json
+test-document.txt
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+secrets.json
+
+# AWS credentials
+.aws/
+aws-credentials.txt
+
+# Test files with sensitive data
+test-*.txt
+sample-*.pdf

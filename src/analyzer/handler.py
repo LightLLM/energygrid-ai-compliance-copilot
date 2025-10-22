@@ -14,6 +14,7 @@ from botocore.exceptions import ClientError
 # Import local modules
 from pdf_extractor import PDFExtractor, PDFExtractionError
 from bedrock_client import BedrockClient, BedrockError
+from nova_client import NovaClient, NovaError
 import sys
 sys.path.append('/opt/python')
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'shared'))
@@ -82,7 +83,16 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     
     # Initialize components
     pdf_extractor = PDFExtractor()
-    bedrock_client = BedrockClient()
+    
+    # Choose AI model based on environment variable
+    ai_model = os.environ.get('AI_MODEL', 'nova').lower()
+    if ai_model == 'nova':
+        ai_client = NovaClient(model_variant=os.environ.get('NOVA_VARIANT', 'pro'))
+        logger.info("Using AWS Nova for AI processing")
+    else:
+        ai_client = BedrockClient()
+        logger.info("Using Claude 3 Sonnet for AI processing")
+    
     db_helper = get_db_helper()
     
     processed_count = 0
@@ -105,7 +115,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             
             # Process the document
             obligations = process_document(
-                pdf_extractor, bedrock_client, db_helper,
+                pdf_extractor, ai_client, db_helper,
                 document_id, s3_key, filename
             )
             
@@ -197,7 +207,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 @trace_document_processing('analysis', document_id)
 def process_document(
     pdf_extractor: PDFExtractor,
-    bedrock_client: BedrockClient,
+    ai_client,  # Can be NovaClient or BedrockClient
     db_helper,
     document_id: str,
     s3_key: str,
@@ -236,9 +246,10 @@ def process_document(
         
         logger.info(f"Successfully extracted {len(extraction_result['text'])} characters using {extraction_result['extraction_method']}")
         
-        # Extract obligations using Bedrock Claude Sonnet
-        logger.info(f"Extracting obligations using Claude Sonnet for document {document_id}")
-        obligations = bedrock_client.extract_obligations(
+        # Extract obligations using AI client (Nova or Claude)
+        ai_model_name = ai_client.__class__.__name__
+        logger.info(f"Extracting obligations using {ai_model_name} for document {document_id}")
+        obligations = ai_client.extract_obligations(
             extraction_result['text'],
             document_id,
             filename
@@ -261,8 +272,8 @@ def process_document(
         logger.error(f"PDF extraction failed for document {document_id}: {e}")
         raise Exception(f"PDF extraction failed: {e}")
     
-    except BedrockError as e:
-        logger.error(f"Bedrock obligation extraction failed for document {document_id}: {e}")
+    except (BedrockError, NovaError) as e:
+        logger.error(f"AI obligation extraction failed for document {document_id}: {e}")
         raise Exception(f"AI obligation extraction failed: {e}")
     
     except ClientError as e:

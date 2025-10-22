@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: EnergyGrid.AI Demo Web Interface for Judges and External Reviewers
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+Globals:
+  Api:
+    Cors:
+      AllowMethods: "'GET,POST,OPTIONS'"
+      AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+      AllowOrigin: "'*'"
+
+Resources:
+  # Demo Web Interface Function
+  DemoWebFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-demo-web"
+      CodeUri: src/web-demo/
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Events:
+        DemoWebApi:
+          Type: Api
+          Properties:
+            Path: /
+            Method: get
+
+  # Claude-style Chatbot Interface Function
+  ChatbotFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-chatbot"
+      CodeUri: src/web-chat/
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Events:
+        ChatbotApi:
+          Type: Api
+          Properties:
+            Path: /chat
+            Method: get
+
+  # Test API Function (for demo purposes)
+  DemoTestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-demo-test"
+      CodeUri: src/test/
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 10
+      MemorySize: 128
+      Events:
+        DemoTestApi:
+          Type: Api
+          Properties:
+            Path: /test
+            Method: get
+
+  # Demo Upload Function (public, no auth)
+  DemoUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-demo-upload"
+      CodeUri: src/demo-upload/
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Events:
+        DemoUploadApi:
+          Type: Api
+          Properties:
+            Path: /documents/upload
+            Method: post
+
+  # Demo Obligations Function (public, no auth)
+  DemoObligationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-demo-obligations"
+      CodeUri: src/demo-obligations/
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Events:
+        DemoObligationsApi:
+          Type: Api
+          Properties:
+            Path: /obligations
+            Method: get
+
+  # Demo Tasks Function (public, no auth)
+  DemoTasksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-demo-tasks"
+      CodeUri: src/demo-tasks/
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Events:
+        DemoTasksApi:
+          Type: Api
+          Properties:
+            Path: /tasks
+            Method: get
+
+  # Demo Reports Function (public, no auth)
+  DemoReportsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-demo-reports"
+      CodeUri: src/demo-reports/
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Events:
+        DemoReportsApi:
+          Type: Api
+          Properties:
+            Path: /reports
+            Method: get
+
+  # Demo Status Function (public, no auth)
+  DemoStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-energygrid-demo-status"
+      CodeUri: src/demo-status/
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Events:
+        DemoStatusApi:
+          Type: Api
+          Properties:
+            Path: /documents/{id}/status
+            Method: get
+
+  # Bedrock Agent Action Executor Function
+  BedrockAgentActionExecutor:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-bedrock-agent-executor"
+      CodeUri: src/bedrock-agent/
+      Handler: action_executor.lambda_handler
+      Runtime: python3.11
+      Timeout: 60
+      MemorySize: 512
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: "*"
+        - S3ReadPolicy:
+            BucketName: "*"
+
+  # IAM Role for Bedrock Agent
+  BedrockAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-bedrock-agent-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockAgentPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt BedrockAgentActionExecutor.Arn
+
+Outputs:
+  DemoWebURL:
+    Description: Demo Web Interface URL for Judges
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
+    Export:
+      Name: !Sub "${Environment}-demo-web-url"
+  
+  ChatbotURL:
+    Description: Claude-style Chatbot Interface URL for Judges
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/chat"
+    Export:
+      Name: !Sub "${Environment}-chatbot-url"
+  
+  DemoApiGatewayId:
+    Description: Demo API Gateway ID
+    Value: !Ref ServerlessRestApi
+    Export:
+      Name: !Sub "${Environment}-demo-api-gateway-id"
+
+  BedrockAgentRoleArn:
+    Description: IAM Role ARN for Bedrock Agent
+    Value: !GetAtt BedrockAgentRole.Arn
+    Export:
+      Name: !Sub "${Environment}-bedrock-agent-role-arn"
+
+  BedrockAgentExecutorArn:
+    Description: Lambda Function ARN for Bedrock Agent Action Executor
+    Value: !GetAtt BedrockAgentActionExecutor.Arn
+    Export:
+      Name: !Sub "${Environment}-bedrock-agent-executor-arn"

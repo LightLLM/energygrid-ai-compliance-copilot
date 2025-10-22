@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EnergyGrid.AI Streamlit Frontend - EC2 Auto Scaling Deployment
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+  
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for the EC2 instances
+  
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet IDs for the EC2 instances
+  
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+
+Resources:
+  # Launch Template
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${Environment}-energygrid-streamlit-lt"
+      LaunchTemplateData:
+        ImageId: ami-0c02fb55956c7d316  # Amazon Linux 2023
+        InstanceType: t3.small
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y python3 python3-pip git nginx
+            
+            # Install Python dependencies
+            pip3 install streamlit pandas plotly requests boto3 python-jose[cryptography]
+            
+            # Clone your repository (replace with your actual repo)
+            cd /home/ec2-user
+            git clone https://github.com/your-username/energygrid-ai-compliance-copilot.git
+            cd energygrid-ai-compliance-copilot
+            
+            # Set environment variables
+            export API_BASE_URL="https://6to1dnyqsd.execute-api.us-east-1.amazonaws.com/Stage"
+            export ENVIRONMENT="${Environment}"
+            
+            # Create systemd service for Streamlit
+            cat > /etc/systemd/system/streamlit.service << EOF
+            [Unit]
+            Description=Streamlit App
+            After=network.target
+            
+            [Service]
+            Type=simple
+            User=ec2-user
+            WorkingDirectory=/home/ec2-user/energygrid-ai-compliance-copilot
+            Environment=API_BASE_URL=https://6to1dnyqsd.execute-api.us-east-1.amazonaws.com/Stage
+            Environment=ENVIRONMENT=${Environment}
+            ExecStart=/usr/local/bin/streamlit run src/web/app.py --server.port 8501 --server.address 0.0.0.0
+            Restart=always
+            
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            
+            # Configure Nginx as reverse proxy
+            cat > /etc/nginx/conf.d/streamlit.conf << EOF
+            server {
+                listen 80;
+                server_name _;
+                
+                location / {
+                    proxy_pass http://127.0.0.1:8501;
+                    proxy_http_version 1.1;
+                    proxy_set_header Upgrade \$http_upgrade;
+                    proxy_set_header Connection "upgrade";
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto \$scheme;
+                }
+                
+                location /_stcore/health {
+                    proxy_pass http://127.0.0.1:8501/_stcore/health;
+                }
+            }
+            EOF
+            
+            # Start services
+            systemctl enable nginx streamlit
+            systemctl start nginx streamlit
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${Environment}-energygrid-streamlit"
+              - Key: Environment
+                Value: !Ref Environment
+
+  # Auto Scaling Group
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${Environment}-energygrid-streamlit-asg"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      VPCZoneIdentifier: !Ref SubnetIds
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-energygrid-streamlit-asg"
+          PropagateAtLaunch: true
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${Environment}-energygrid-streamlit-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  # Target Group
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${Environment}-energygrid-streamlit-tg"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      HealthCheckPath: /_stcore/health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # Security Groups
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${Environment}-energygrid-alb-sg"
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${Environment}-energygrid-ec2-sg"
+      GroupDescription: Security group for EC2 instances
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0  # Restrict this to your IP for security
+
+  # IAM Role for EC2
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: "*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+Outputs:
+  LoadBalancerURL:
+    Description: Application Load Balancer URL
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
+    Export:
+      Name: !Sub "${Environment}-streamlit-ec2-alb-url"

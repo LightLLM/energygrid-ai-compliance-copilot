@@ -39,7 +39,7 @@ Globals:
         REPORTING_QUEUE: !Ref ReportingQueue
         NOTIFICATION_TOPIC: !Ref NotificationTopic
         NOTIFICATION_TOPIC_ARN: !Ref NotificationTopic
-        _X_AMZN_TRACE_ID: !Sub "${AWS::StackName}-trace"
+
 
 Resources:
   # Cognito User Pool
@@ -405,7 +405,7 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub "${Environment}-energygrid-upload-queue"
-      VisibilityTimeoutSeconds: 300
+      VisibilityTimeout: 300
       MessageRetentionPeriod: 1209600  # 14 days
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt UploadDeadLetterQueue.Arn
@@ -421,7 +421,7 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub "${Environment}-energygrid-analysis-queue"
-      VisibilityTimeoutSeconds: 900  # 15 minutes
+      VisibilityTimeout: 900  # 15 minutes
       MessageRetentionPeriod: 1209600  # 14 days
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt AnalysisDeadLetterQueue.Arn
@@ -437,7 +437,7 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub "${Environment}-energygrid-planning-queue"
-      VisibilityTimeoutSeconds: 600  # 10 minutes
+      VisibilityTimeout: 600  # 10 minutes
       MessageRetentionPeriod: 1209600  # 14 days
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt PlanningDeadLetterQueue.Arn
@@ -453,7 +453,7 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub "${Environment}-energygrid-reporting-queue"
-      VisibilityTimeoutSeconds: 600  # 10 minutes
+      VisibilityTimeout: 600  # 10 minutes
       MessageRetentionPeriod: 1209600  # 14 days
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt ReportingDeadLetterQueue.Arn
@@ -473,9 +473,6 @@ Resources:
       DisplayName: EnergyGrid.AI Notifications
       DeliveryStatusLogging:
         - Protocol: lambda
-          SuccessFeedbackRoleArn: !GetAtt SNSLoggingRole.Arn
-          FailureFeedbackRoleArn: !GetAtt SNSLoggingRole.Arn
-        - Protocol: email
           SuccessFeedbackRoleArn: !GetAtt SNSLoggingRole.Arn
           FailureFeedbackRoleArn: !GetAtt SNSLoggingRole.Arn
 
@@ -747,10 +744,6 @@ Resources:
             Method: post
             Auth:
               Authorizer: CognitoAuthorizer
-            RequestValidator: BodyAndParametersValidator
-            RequestModel:
-              Model: UploadRequestModel
-              Required: true
 
   UploadOptionsFunction:
     Type: AWS::Serverless::Function
@@ -783,6 +776,8 @@ Resources:
           ANALYSIS_QUEUE_URL: !Ref AnalysisQueue
           PLANNING_QUEUE_URL: !Ref PlanningQueue
           ANALYSIS_DLQ_URL: !Ref AnalysisDeadLetterQueue
+          AI_MODEL: nova
+          NOVA_VARIANT: pro
       Policies:
         - S3ReadPolicy:
             BucketName: !Ref DocumentsBucket
@@ -941,7 +936,6 @@ Resources:
             Method: get
             Auth:
               Authorizer: CognitoAuthorizer
-            RequestValidator: ParametersValidator
             RequestParameters:
               - method.request.querystring.category
               - method.request.querystring.severity
@@ -988,7 +982,6 @@ Resources:
             Method: get
             Auth:
               Authorizer: CognitoAuthorizer
-            RequestValidator: ParametersValidator
             RequestParameters:
               - method.request.querystring.status
               - method.request.querystring.priority
@@ -1048,10 +1041,6 @@ Resources:
             Method: post
             Auth:
               Authorizer: CognitoAuthorizer
-            RequestValidator: BodyAndParametersValidator
-            RequestModel:
-              Model: ReportGenerateRequestModel
-              Required: true
         ReportsGetApi:
           Type: Api
           Properties:
@@ -1060,7 +1049,6 @@ Resources:
             Method: get
             Auth:
               Authorizer: CognitoAuthorizer
-            RequestValidator: ParametersValidator
             RequestParameters:
               - method.request.path.id
 
@@ -1188,173 +1176,6 @@ Resources:
             AuthType: TOKEN
             IdentitySource: method.request.header.Authorization
         DefaultAuthorizer: CognitoAuthorizer
-      ThrottleSettings:
-        RateLimit: 1000
-        BurstLimit: 2000
-      RequestValidators:
-        BodyValidator:
-          ValidateRequestBody: true
-          ValidateRequestParameters: false
-        ParametersValidator:
-          ValidateRequestBody: false
-          ValidateRequestParameters: true
-        BodyAndParametersValidator:
-          ValidateRequestBody: true
-          ValidateRequestParameters: true
-      Models:
-        UploadRequestModel:
-          ContentType: multipart/form-data
-          Schema:
-            type: object
-            properties:
-              file:
-                type: string
-                format: binary
-                description: PDF file to upload
-            required:
-              - file
-        ReportGenerateRequestModel:
-          ContentType: application/json
-          Schema:
-            type: object
-            properties:
-              report_type:
-                type: string
-                enum: [compliance_summary, audit_readiness, obligation_status, task_progress]
-                description: Type of report to generate
-              title:
-                type: string
-                maxLength: 200
-                description: Custom title for the report
-              date_range:
-                type: object
-                properties:
-                  start_date:
-                    type: string
-                    format: date
-                  end_date:
-                    type: string
-                    format: date
-              filters:
-                type: object
-                properties:
-                  category:
-                    type: string
-                  severity:
-                    type: string
-                  status:
-                    type: string
-            required:
-              - report_type
-        ErrorResponseModel:
-          ContentType: application/json
-          Schema:
-            type: object
-            properties:
-              success:
-                type: boolean
-                default: false
-              error:
-                type: string
-              timestamp:
-                type: string
-                format: date-time
-            required:
-              - success
-              - error
-      GatewayResponses:
-        DEFAULT_4XX:
-          ResponseParameters:
-            Headers:
-              Access-Control-Allow-Origin: "'*'"
-              Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
-              Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
-          ResponseTemplates:
-            application/json: |
-              {
-                "success": false,
-                "error": "Client error occurred",
-                "timestamp": "$context.requestTime"
-              }
-        DEFAULT_5XX:
-          ResponseParameters:
-            Headers:
-              Access-Control-Allow-Origin: "'*'"
-              Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
-              Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
-          ResponseTemplates:
-            application/json: |
-              {
-                "success": false,
-                "error": "Internal server error",
-                "timestamp": "$context.requestTime"
-              }
-        BAD_REQUEST_BODY:
-          StatusCode: 400
-          ResponseParameters:
-            Headers:
-              Access-Control-Allow-Origin: "'*'"
-              Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
-          ResponseTemplates:
-            application/json: |
-              {
-                "success": false,
-                "error": "Invalid request format",
-                "timestamp": "$context.requestTime"
-              }
-        REQUEST_TOO_LARGE:
-          StatusCode: 413
-          ResponseParameters:
-            Headers:
-              Access-Control-Allow-Origin: "'*'"
-              Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
-          ResponseTemplates:
-            application/json: |
-              {
-                "success": false,
-                "error": "File size exceeds maximum limit",
-                "timestamp": "$context.requestTime"
-              }
-        UNAUTHORIZED:
-          StatusCode: 401
-          ResponseParameters:
-            Headers:
-              Access-Control-Allow-Origin: "'*'"
-              Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
-          ResponseTemplates:
-            application/json: |
-              {
-                "success": false,
-                "error": "Authentication required",
-                "timestamp": "$context.requestTime"
-              }
-        ACCESS_DENIED:
-          StatusCode: 403
-          ResponseParameters:
-            Headers:
-              Access-Control-Allow-Origin: "'*'"
-              Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
-          ResponseTemplates:
-            application/json: |
-              {
-                "success": false,
-                "error": "Access denied",
-                "timestamp": "$context.requestTime"
-              }
-        THROTTLED:
-          StatusCode: 429
-          ResponseParameters:
-            Headers:
-              Access-Control-Allow-Origin: "'*'"
-              Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
-              Retry-After: "'60'"
-          ResponseTemplates:
-            application/json: |
-              {
-                "success": false,
-                "error": "Rate limit exceeded. Please try again later.",
-                "timestamp": "$context.requestTime"
-              }
 
 Outputs:
   ApiGatewayUrl:

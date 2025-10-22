@@ -1,0 +1,81 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EnergyGrid.AI Streamlit Frontend - AWS App Runner Deployment
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+  
+  GitHubRepo:
+    Type: String
+    Default: "your-username/energygrid-ai-compliance-copilot"
+    Description: GitHub repository (format: username/repo-name)
+  
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: GitHub branch to deploy
+
+Resources:
+  # App Runner Service
+  StreamlitAppRunnerService:
+    Type: AWS::AppRunner::Service
+    Properties:
+      ServiceName: !Sub "${Environment}-energygrid-streamlit-app"
+      SourceConfiguration:
+        AutoDeploymentsEnabled: true
+        CodeRepository:
+          RepositoryUrl: !Sub "https://github.com/${GitHubRepo}"
+          SourceCodeVersion:
+            Type: BRANCH
+            Value: !Ref GitHubBranch
+          CodeConfiguration:
+            ConfigurationSource: REPOSITORY
+            CodeConfigurationValues:
+              Runtime: PYTHON_3_11
+              BuildCommand: |
+                pip install -r requirements.txt
+              StartCommand: |
+                streamlit run src/web/app.py --server.port 8000 --server.address 0.0.0.0
+              RuntimeEnvironmentVariables:
+                - Name: API_BASE_URL
+                  Value: https://6to1dnyqsd.execute-api.us-east-1.amazonaws.com/Stage
+                - Name: ENVIRONMENT
+                  Value: !Ref Environment
+      InstanceConfiguration:
+        Cpu: 1 vCPU
+        Memory: 2 GB
+      HealthCheckConfiguration:
+        Protocol: HTTP
+        Path: /_stcore/health
+        Interval: 10
+        Timeout: 5
+        HealthyThreshold: 1
+        UnhealthyThreshold: 5
+
+  # IAM Role for App Runner
+  AppRunnerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: tasks.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+
+Outputs:
+  AppRunnerServiceUrl:
+    Description: App Runner Service URL
+    Value: !Sub "https://${StreamlitAppRunnerService.ServiceUrl}"
+    Export:
+      Name: !Sub "${Environment}-streamlit-app-url"
+  
+  AppRunnerServiceArn:
+    Description: App Runner Service ARN
+    Value: !Ref StreamlitAppRunnerService
