@@ -7,7 +7,7 @@
 [![AWS Nova](https://img.shields.io/badge/AWS-Nova%20Pro-orange.svg)](https://aws.amazon.com/bedrock/nova/)
 [![Bedrock AgentCore](https://img.shields.io/badge/Bedrock-AgentCore-blue.svg)](https://aws.amazon.com/bedrock/agents/)
 
-**🏆 AWS Hackathon Winner - Advanced AI Compliance Management System**
+**🏆 AWS Hackathon - Advanced AI Compliance Management System**
 
 An intelligent compliance management system for energy sector organizations, powered by **AWS Nova models** and **Amazon Bedrock AgentCore**. EnergyGrid.AI revolutionizes regulatory compliance through autonomous AI agents, real-time document processing, and conversational interfaces.
 
